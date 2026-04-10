@@ -109,7 +109,7 @@ fn build_record_into(buf: &mut [u8], seq: u64, payload: &[u8], direct: bool) -> 
     let total_len = 8 + payload.len();
     let raw_len = 4 + total_len;
     let write_len = if direct {
-        (raw_len + ALIGN - 1) / ALIGN * ALIGN
+        raw_len.div_ceil(ALIGN) * ALIGN
     } else {
         raw_len
     };
@@ -132,7 +132,7 @@ struct AlignedBuf {
 impl AlignedBuf {
     fn new(capacity: usize) -> Self {
         use std::alloc::{Layout, alloc_zeroed};
-        let cap = (capacity + ALIGN - 1) / ALIGN * ALIGN;
+        let cap = capacity.div_ceil(ALIGN) * ALIGN;
         let layout = Layout::from_size_align(cap, ALIGN).expect("invalid layout");
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "allocation failed");
@@ -197,7 +197,7 @@ fn do_sync(file: &std::fs::File, sync_data: bool) {
 fn estimate_prealloc(args: &Args) -> u64 {
     let max_record = 4 + 8 + args.max_record_size;
     let per_write = if args.direct {
-        (max_record + ALIGN - 1) / ALIGN * ALIGN
+        max_record.div_ceil(ALIGN) * ALIGN
     } else {
         max_record
     };
@@ -232,7 +232,7 @@ async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
     let mut measured_bytes: u64 = 0;
     let mut latencies_us = Vec::with_capacity(args.writes_per_task);
     let max_record_raw = 4 + 8 + args.max_record_size;
-    let max_write_len = (max_record_raw + ALIGN - 1) / ALIGN * ALIGN;
+    let max_write_len = max_record_raw.div_ceil(ALIGN) * ALIGN;
 
     // Pre-allocate payload and write buffers
     let mut payload_buf = vec![0u8; args.max_record_size];
@@ -253,8 +253,8 @@ async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
             // O_DIRECT: build directly into aligned buffer
             write_len = build_record_into(abuf.as_mut_slice(), seq, &payload_buf[..payload_len], true);
 
-            if replica_file.is_some() {
-                let replica_file = replica_file.as_ref().unwrap().clone();
+            if let Some(ref replica_arc) = replica_file {
+                let replica_arc = replica_arc.clone();
                 let record_copy = abuf.as_slice(write_len).to_vec();
                 let sync_data = args.sync_data;
 
@@ -263,7 +263,7 @@ async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
                 let replica_handle = tokio::spawn(async move {
                     use std::io::Write;
                     let t_replica = Instant::now();
-                    let mut rfile = replica_file.lock().unwrap();
+                    let mut rfile = replica_arc.lock().unwrap();
                     rfile.write_all(&record_copy).expect("replica write failed");
                     do_sync(&rfile, sync_data);
                     t_replica.elapsed().as_micros() as u64
@@ -295,8 +295,8 @@ async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
         } else {
             write_len = build_record_into(&mut record_buf, seq, &payload_buf[..payload_len], false);
 
-            if replica_file.is_some() {
-                let replica_file = replica_file.as_ref().unwrap().clone();
+            if let Some(ref replica_arc) = replica_file {
+                let replica_arc = replica_arc.clone();
                 let record_copy = record_buf[..write_len].to_vec();
                 let sync_data = args.sync_data;
 
@@ -305,7 +305,7 @@ async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
                 let replica_handle = tokio::spawn(async move {
                     use std::io::Write;
                     let t_replica = Instant::now();
-                    let mut rfile = replica_file.lock().unwrap();
+                    let mut rfile = replica_arc.lock().unwrap();
                     rfile.write_all(&record_copy).expect("replica write failed");
                     do_sync(&rfile, sync_data);
                     t_replica.elapsed().as_micros() as u64
@@ -407,7 +407,7 @@ async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
     let mut measured_bytes: u64 = 0;
     let mut latencies_us = Vec::with_capacity(args.writes_per_task);
     let max_record_raw = 4 + 8 + args.max_record_size;
-    let max_write_len = (max_record_raw + ALIGN - 1) / ALIGN * ALIGN;
+    let max_write_len = max_record_raw.div_ceil(ALIGN) * ALIGN;
 
     let mut payload_buf = vec![0u8; args.max_record_size];
     let mut record_buf = vec![0u8; max_write_len];
@@ -547,7 +547,7 @@ async fn writer_task_channel(
     let prealloc = estimate_prealloc(args);
 
     let max_record_raw = 4 + 8 + args.max_record_size;
-    let max_write_len = (max_record_raw + ALIGN - 1) / ALIGN * ALIGN;
+    let max_write_len = max_record_raw.div_ceil(ALIGN) * ALIGN;
 
     // Double-buffer scheme: sender fills a buffer and sends it to IO thread,
     // IO thread writes it and sends the buffer back for reuse. No per-write allocation.
