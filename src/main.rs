@@ -30,7 +30,7 @@ fn parse_cores(s: &str) -> Result<Vec<CoreId>, String> {
     Ok(cores)
 }
 
-/// Benchmark NFS v4 sync-write performance mimicking WAL workload.
+/// Benchmark sync-write performance mimicking WAL workload.
 /// Each Tokio task appends variable-sized records to its own file,
 /// calling fsync after every write.
 #[derive(Parser, Debug)]

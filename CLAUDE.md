@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**nfs-wal-bench** -- a Rust/Tokio benchmark that evaluates NFS v4 (or local) sync-write performance by mimicking a WAL (Write-Ahead Log) workload. Each concurrent task sequentially appends variable-sized records to its own file, calling fsync/fdatasync after every write.
+**wal-bench** -- a Rust/Tokio benchmark that evaluates sync-write performance (local SSD, NFS, or any filesystem) by mimicking a WAL (Write-Ahead Log) workload. Each concurrent task sequentially appends variable-sized records to its own file, calling fsync/fdatasync after every write.
 
 ## Build & Run
 
 ```bash
 cargo build --release
-./target/release/nfs-wal-bench --dir /mnt/nfs/wal-test -c 8 -m channel --direct --sync-data
+./target/release/wal-bench --dir /mnt/nfs/wal-test -c 8 -m channel --direct --sync-data
 ```
 
 Rust edition 2024 -- `gen` is a reserved keyword; use `r#gen` when calling `rand::Rng` methods.
@@ -19,7 +19,7 @@ Rust edition 2024 -- `gen` is a reserved keyword; use `r#gen` when calling `rand
 
 Single-file binary (`src/main.rs`) with three I/O modes controlled by `-m`:
 
-- **std** -- blocking `std::fs` write+sync directly on tokio worker threads. Concurrency is limited by `-t` (worker thread count) since each write blocks the thread.
+- **std** -- blocking `std::fs` write+sync directly on tokio worker threads. Concurrency is limited by worker thread count (set via `--worker-cores`) since each write blocks the thread.
 - **tokio** -- `tokio::fs` async write+sync, which internally uses `spawn_blocking`. True concurrency beyond worker thread count, but per-op overhead from the blocking pool.
 - **channel** -- dedicated `std::thread` per task for I/O, communicating with tokio coroutines via `std::sync::mpsc` (records) and `tokio::sync::mpsc` (latencies). Best option when you need pinned I/O thread affinity (`--io-cores`).
 
