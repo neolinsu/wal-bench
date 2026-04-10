@@ -457,6 +457,16 @@ async fn writer_task_channel(
     }
 }
 
+fn print_histogram(label: &str, hist: &Histogram<u64>) {
+    println!("Fsync latency{} (us):", label);
+    println!("  min:    {:>10}", hist.min());
+    println!("  p50:    {:>10}", hist.value_at_percentile(50.0));
+    println!("  p90:    {:>10}", hist.value_at_percentile(90.0));
+    println!("  p99:    {:>10}", hist.value_at_percentile(99.0));
+    println!("  p99.9:  {:>10}", hist.value_at_percentile(99.9));
+    println!("  max:    {:>10}", hist.max());
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -562,7 +572,10 @@ async fn run(args: Args) {
     let wall_elapsed = wall_start.elapsed();
 
     // Aggregate stats
+    let cow_mode = args.replica_dir.is_some();
     let mut hist = Histogram::<u64>::new(3).unwrap();
+    let mut primary_hist = Histogram::<u64>::new(3).unwrap();
+    let mut replica_hist = Histogram::<u64>::new(3).unwrap();
     let mut grand_total_bytes: u64 = 0;
     let mut grand_measured_bytes: u64 = 0;
     let total_writes: u64 = results.iter().map(|r| r.latencies_us.len() as u64).sum();
@@ -572,6 +585,12 @@ async fn run(args: Args) {
         grand_measured_bytes += r.measured_bytes;
         for &lat in &r.latencies_us {
             hist.record(lat).ok();
+        }
+        for &lat in &r.primary_latencies_us {
+            primary_hist.record(lat).ok();
+        }
+        for &lat in &r.replica_latencies_us {
+            replica_hist.record(lat).ok();
         }
     }
 
@@ -587,13 +606,15 @@ async fn run(args: Args) {
     println!("Throughput:      {throughput_mbs:.2} MB/s");
     println!("IOPS:            {iops:.0}");
     println!();
-    println!("Fsync latency (us):");
-    println!("  min:    {:>10}", hist.min());
-    println!("  p50:    {:>10}", hist.value_at_percentile(50.0));
-    println!("  p90:    {:>10}", hist.value_at_percentile(90.0));
-    println!("  p99:    {:>10}", hist.value_at_percentile(99.0));
-    println!("  p99.9:  {:>10}", hist.value_at_percentile(99.9));
-    println!("  max:    {:>10}", hist.max());
+    if cow_mode {
+        print_histogram(" - combined", &hist);
+        println!();
+        print_histogram(" - primary", &primary_hist);
+        println!();
+        print_histogram(" - replica", &replica_hist);
+    } else {
+        print_histogram("", &hist);
+    }
 
     // Per-task summary
     println!("\nPer-task breakdown:");
