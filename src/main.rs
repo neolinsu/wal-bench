@@ -879,6 +879,14 @@ async fn run(args: Args) {
                 eprintln!("  warning: failed to remove {}: {e}", path.display());
             }
         }
+        if let Some(ref replica_dir) = args.replica_dir {
+            for id in 0..args.concurrency {
+                let path = replica_dir.join(format!("wal-{id:04}.log"));
+                if let Err(e) = std::fs::remove_file(&path) {
+                    eprintln!("  warning: failed to remove {}: {e}", path.display());
+                }
+            }
+        }
         println!("Done.");
     }
 }
