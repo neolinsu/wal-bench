@@ -210,6 +210,8 @@ struct TaskResult {
     measured_bytes: u64,
     elapsed: Duration,
     latencies_us: Vec<u64>,
+    primary_latencies_us: Vec<u64>,
+    replica_latencies_us: Vec<u64>,
 }
 
 fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
@@ -273,6 +275,8 @@ fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
         measured_bytes,
         elapsed,
         latencies_us,
+        primary_latencies_us: Vec::new(),
+        replica_latencies_us: Vec::new(),
     }
 }
 
@@ -359,6 +363,8 @@ async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
         measured_bytes,
         elapsed,
         latencies_us,
+        primary_latencies_us: Vec::new(),
+        replica_latencies_us: Vec::new(),
     }
 }
 
@@ -446,6 +452,8 @@ async fn writer_task_channel(
         measured_bytes,
         elapsed,
         latencies_us,
+        primary_latencies_us: Vec::new(),
+        replica_latencies_us: Vec::new(),
     }
 }
 
