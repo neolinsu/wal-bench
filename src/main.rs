@@ -552,7 +552,7 @@ async fn writer_task_channel(
     // Double-buffer scheme: sender fills a buffer and sends it to IO thread,
     // IO thread writes it and sends the buffer back for reuse. No per-write allocation.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(1);
-    let (ret_tx, mut ret_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (ret_tx, mut ret_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(1);
 
     let io_thread = std::thread::spawn(move || {
         if let Some(core) = io_core {
@@ -564,6 +564,7 @@ async fn writer_task_channel(
         let mut abuf = if direct { Some(AlignedBuf::new(max_write_len)) } else { None };
 
         while let Ok((buf, len)) = rx.recv() {
+            let t = Instant::now();
             if let Some(ref mut abuf) = abuf {
                 abuf.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
                 file.write_all(abuf.as_slice(len)).expect("write failed");
@@ -571,16 +572,59 @@ async fn writer_task_channel(
                 file.write_all(&buf[..len]).expect("write failed");
             }
             do_sync(&file, sync_data);
-            if ret_tx.blocking_send(buf).is_err() {
+            let lat = t.elapsed().as_micros() as u64;
+            if ret_tx.blocking_send((buf, lat)).is_err() {
                 break;
             }
         }
     });
 
+    let replica_channels = args.replica_dir.as_ref().map(|rd| {
+        let rpath = rd.join(format!("wal-{task_id:04}.log"));
+        let direct_r = direct;
+        let sync_data_r = sync_data;
+        let prealloc_r = prealloc;
+        let max_write_len_r = max_write_len;
+
+        let (rtx, rrx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(1);
+        let (rret_tx, rret_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(1);
+
+        let replica_io_core = io_core; // same pinning strategy
+        let replica_thread = std::thread::spawn(move || {
+            if let Some(core) = replica_io_core {
+                core_affinity::set_for_current(core);
+            }
+            use std::io::Write;
+
+            let mut file = open_direct(&rpath, direct_r, prealloc_r);
+            let mut abuf = if direct_r { Some(AlignedBuf::new(max_write_len_r)) } else { None };
+
+            while let Ok((buf, len)) = rrx.recv() {
+                let t = Instant::now();
+                if let Some(ref mut abuf) = abuf {
+                    abuf.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
+                    file.write_all(abuf.as_slice(len)).expect("replica write failed");
+                } else {
+                    file.write_all(&buf[..len]).expect("replica write failed");
+                }
+                do_sync(&file, sync_data_r);
+                let lat = t.elapsed().as_micros() as u64;
+                if rret_tx.blocking_send((buf, lat)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        (rtx, rret_rx, replica_thread)
+    });
+    let mut replica_channels = replica_channels;
+
     let mut rng = StdRng::from_entropy();
     let mut total_bytes: u64 = 0;
     let mut measured_bytes: u64 = 0;
     let mut latencies_us = Vec::with_capacity(args.writes_per_task);
+    let mut primary_latencies_us = Vec::with_capacity(if replica_channels.is_some() { args.writes_per_task } else { 0 });
+    let mut replica_latencies_us = Vec::with_capacity(if replica_channels.is_some() { args.writes_per_task } else { 0 });
     let mut payload_buf = vec![0u8; args.max_record_size];
     // Two pre-allocated buffers for double-buffering
     let mut send_buf = vec![0u8; max_write_len];
@@ -595,22 +639,50 @@ async fn writer_task_channel(
         let write_len = build_record_into(&mut send_buf, seq, &payload_buf[..payload_len], direct);
         total_bytes += write_len as u64;
 
-        // Measure perceived latency including channel overhead
-        let t0 = Instant::now();
-        tx.send((send_buf, write_len)).expect("send failed");
-        // Get the buffer back from the IO thread (reuse it)
-        send_buf = ret_rx.recv().await.expect("recv failed");
-        let lat = t0.elapsed();
+        if let Some((ref rtx, ref mut rret_rx, _)) = replica_channels {
+            // Copy record to replica buffer BEFORE sending primary (which moves send_buf)
+            let mut replica_buf = spare_buf.take().unwrap_or_else(|| vec![0u8; max_write_len]);
+            replica_buf[..write_len].copy_from_slice(&send_buf[..write_len]);
+            rtx.send((replica_buf, write_len)).expect("replica send failed");
 
-        if seq >= args.warmup as u64 {
-            latencies_us.push(lat.as_micros() as u64);
-            measured_bytes += write_len as u64;
+            // Send to primary
+            tx.send((send_buf, write_len)).expect("send failed");
+
+            // Await both
+            let (primary_ret, primary_lat) = ret_rx.recv().await.expect("recv failed");
+            let (replica_ret, replica_lat) = rret_rx.recv().await.expect("replica recv failed");
+
+            send_buf = primary_ret;
+            spare_buf = Some(replica_ret);
+
+            let combined_lat = primary_lat.max(replica_lat);
+
+            if seq >= args.warmup as u64 {
+                latencies_us.push(combined_lat);
+                primary_latencies_us.push(primary_lat);
+                replica_latencies_us.push(replica_lat);
+                measured_bytes += write_len as u64;
+            }
+        } else {
+            tx.send((send_buf, write_len)).expect("send failed");
+            let (ret, primary_lat) = ret_rx.recv().await.expect("recv failed");
+            send_buf = ret;
+
+            if seq >= args.warmup as u64 {
+                latencies_us.push(primary_lat);
+                measured_bytes += write_len as u64;
+            }
         }
     }
 
     drop(tx);
     drop(spare_buf.take());
     io_thread.join().expect("io thread panicked");
+
+    if let Some((rtx, _, replica_thread)) = replica_channels {
+        drop(rtx);
+        replica_thread.join().expect("replica io thread panicked");
+    }
 
     let elapsed = start.elapsed();
 
@@ -620,8 +692,8 @@ async fn writer_task_channel(
         measured_bytes,
         elapsed,
         latencies_us,
-        primary_latencies_us: Vec::new(),
-        replica_latencies_us: Vec::new(),
+        primary_latencies_us,
+        replica_latencies_us,
     }
 }
 
