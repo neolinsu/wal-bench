@@ -39,6 +39,10 @@ struct Args {
     #[arg(short, long)]
     dir: PathBuf,
 
+    /// Replica directory for COW dual-write mode (enables writing to both --dir and --replica-dir)
+    #[arg(long)]
+    replica_dir: Option<PathBuf>,
+
     /// Number of concurrent writer tasks
     #[arg(short = 'c', long, default_value_t = 4)]
     concurrency: usize,
@@ -480,6 +484,9 @@ fn main() {
 
 async fn run(args: Args) {
     std::fs::create_dir_all(&args.dir).expect("failed to create output directory");
+    if let Some(ref replica_dir) = args.replica_dir {
+        std::fs::create_dir_all(replica_dir).expect("failed to create replica directory");
+    }
 
     let mode_str = match args.io_mode {
         IoMode::Std => "std",
@@ -489,9 +496,13 @@ async fn run(args: Args) {
 
     let worker_cores_str = args.worker_cores.as_deref().unwrap_or("all");
     let io_cores_str = args.io_cores.as_deref().unwrap_or("none");
+    let cow_str = match &args.replica_dir {
+        Some(rd) => format!("enabled ({})", rd.display()),
+        None => "disabled".to_string(),
+    };
 
     println!(
-        "Starting WAL sync-write benchmark\n  dir:            {}\n  concurrency:    {}\n  writes/task:    {}\n  warmup/task:    {}\n  record size:    {}..{} bytes\n  io mode:        {}\n  O_DIRECT:       {}\n  sync mode:      {}\n  worker cores:   {}\n  io cores:       {}",
+        "Starting WAL sync-write benchmark\n  dir:            {}\n  concurrency:    {}\n  writes/task:    {}\n  warmup/task:    {}\n  record size:    {}..{} bytes\n  io mode:        {}\n  O_DIRECT:       {}\n  sync mode:      {}\n  worker cores:   {}\n  io cores:       {}\n  COW mode:       {}",
         args.dir.display(),
         args.concurrency,
         args.writes_per_task,
@@ -503,6 +514,7 @@ async fn run(args: Args) {
         if args.sync_data { "fdatasync" } else { "fsync" },
         worker_cores_str,
         io_cores_str,
+        cow_str,
     );
 
     // Parse io_cores once, share across tasks
