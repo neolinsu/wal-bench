@@ -2,7 +2,6 @@
 
 A Rust benchmark that evaluates WAL (Write-Ahead Log) (sync-) write performance on filesystems.
 
-Each concurrent task sequentially appends variable-sized records to its own file, calling fsync/fdatasync after every write.
 
 ## Why
 
