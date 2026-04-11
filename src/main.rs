@@ -1,701 +1,15 @@
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+mod common;
+mod mode_std;
+mod mode_tokio;
+mod mode_channel;
+mod mode_thread;
 
-use clap::{Parser, ValueEnum};
-use core_affinity::CoreId;
+use std::time::Instant;
+
+use clap::Parser;
 use hdrhistogram::Histogram;
-use rand::rngs::StdRng;
-use rand::{Rng, RngCore, SeedableRng};
-use tokio::io::AsyncWriteExt;
 
-/// Parse a core range like "0-3" or "0,2,4" or "0-3,6,8-10" into a Vec<CoreId>.
-fn parse_cores(s: &str) -> Result<Vec<CoreId>, String> {
-    let mut cores = Vec::new();
-    for part in s.split(',') {
-        let part = part.trim();
-        if let Some((a, b)) = part.split_once('-') {
-            let start: usize = a.trim().parse().map_err(|e| format!("invalid core: {e}"))?;
-            let end: usize = b.trim().parse().map_err(|e| format!("invalid core: {e}"))?;
-            for id in start..=end {
-                cores.push(CoreId { id });
-            }
-        } else {
-            let id: usize = part.parse().map_err(|e| format!("invalid core: {e}"))?;
-            cores.push(CoreId { id });
-        }
-    }
-    if cores.is_empty() {
-        return Err("empty core list".into());
-    }
-    Ok(cores)
-}
-
-/// Benchmark sync-write performance mimicking WAL workload.
-/// Each Tokio task appends variable-sized records to its own file,
-/// calling fsync after every write.
-#[derive(Parser, Debug)]
-struct Args {
-    /// Directory to write files into (point this at an NFS mount)
-    #[arg(short, long)]
-    dir: PathBuf,
-
-    /// Replica directory for COW dual-write mode (enables writing to both --dir and --replica-dir)
-    #[arg(long)]
-    replica_dir: Option<PathBuf>,
-
-    /// Number of concurrent writer tasks
-    #[arg(short = 'c', long, default_value_t = 4)]
-    concurrency: usize,
-
-    /// Total number of writes per task
-    #[arg(short = 'n', long, default_value_t = 1000)]
-    writes_per_task: usize,
-
-    /// Number of warmup writes per task (excluded from stats)
-    #[arg(long, default_value_t = 0)]
-    warmup: usize,
-
-    /// Minimum WAL record size in bytes
-    #[arg(long, default_value_t = 64)]
-    min_record_size: usize,
-
-    /// Maximum WAL record size in bytes
-    #[arg(long, default_value_t = 8192)]
-    max_record_size: usize,
-
-    /// Pin tokio worker threads to these CPU cores (e.g. "0-3" or "0,2,4")
-    #[arg(long)]
-    worker_cores: Option<String>,
-
-    /// Pin I/O threads (channel mode) to these CPU cores (e.g. "4-7")
-    #[arg(long)]
-    io_cores: Option<String>,
-
-    /// Max blocking threads for tokio runtime (default: 512)
-    #[arg(long)]
-    max_blocking_threads: Option<usize>,
-
-    /// I/O mode: "std" for std::fs sync I/O, "tokio" for tokio::fs async I/O,
-    /// "channel" for dedicated I/O threads communicating via channels
-    #[arg(short = 'm', long, default_value = "std")]
-    io_mode: IoMode,
-
-    /// Open files with O_DIRECT (bypass page cache)
-    #[arg(long, default_value_t = false)]
-    direct: bool,
-
-    /// Use fdatasync instead of fsync (skip metadata sync)
-    #[arg(long, default_value_t = false)]
-    sync_data: bool,
-
-    /// Remove WAL files after benchmark completes
-    #[arg(long, default_value_t = false)]
-    cleanup: bool,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-enum IoMode {
-    Std,
-    Tokio,
-    Channel,
-}
-
-const ALIGN: usize = 512;
-
-/// Build a WAL-like record in-place into `buf`:
-/// 4-byte length prefix + 8-byte sequence number + payload.
-/// Returns the number of bytes to write (padded to ALIGN when direct).
-fn build_record_into(buf: &mut [u8], seq: u64, payload: &[u8], direct: bool) -> usize {
-    let total_len = 8 + payload.len();
-    let raw_len = 4 + total_len;
-    let write_len = if direct {
-        raw_len.div_ceil(ALIGN) * ALIGN
-    } else {
-        raw_len
-    };
-    buf[..4].copy_from_slice(&(total_len as u32).to_le_bytes());
-    buf[4..12].copy_from_slice(&seq.to_le_bytes());
-    buf[12..12 + payload.len()].copy_from_slice(payload);
-    // Zero padding for O_DIRECT alignment
-    if direct && write_len > raw_len {
-        buf[raw_len..write_len].fill(0);
-    }
-    write_len
-}
-
-/// Reusable aligned buffer for O_DIRECT writes.
-struct AlignedBuf {
-    ptr: *mut u8,
-    capacity: usize,
-}
-
-impl AlignedBuf {
-    fn new(capacity: usize) -> Self {
-        use std::alloc::{Layout, alloc_zeroed};
-        let cap = capacity.div_ceil(ALIGN) * ALIGN;
-        let layout = Layout::from_size_align(cap, ALIGN).expect("invalid layout");
-        let ptr = unsafe { alloc_zeroed(layout) };
-        assert!(!ptr.is_null(), "allocation failed");
-        Self { ptr, capacity: cap }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.capacity) }
-    }
-
-    fn as_slice(&self, len: usize) -> &[u8] {
-        assert!(len <= self.capacity);
-        unsafe { std::slice::from_raw_parts(self.ptr, len) }
-    }
-}
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        use std::alloc::{Layout, dealloc};
-        let layout = Layout::from_size_align(self.capacity, ALIGN).expect("invalid layout");
-        unsafe { dealloc(self.ptr, layout) };
-    }
-}
-
-unsafe impl Send for AlignedBuf {}
-unsafe impl Sync for AlignedBuf {}
-
-/// Open a file with optional O_DIRECT, returning a std::fs::File.
-/// Pre-allocates space so that fdatasync doesn't need to update extents/size.
-fn open_direct(path: &std::path::Path, direct: bool, prealloc_bytes: u64) -> std::fs::File {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).truncate(true).write(true);
-    if direct {
-        opts.custom_flags(libc::O_DIRECT);
-    }
-    let file = opts.open(path)
-        .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
-    if prealloc_bytes > 0 {
-        let ret = unsafe {
-            libc::fallocate(file.as_raw_fd(), 0, 0, prealloc_bytes as libc::off_t)
-        };
-        if ret != 0 {
-            panic!("fallocate failed: {}", std::io::Error::last_os_error());
-        }
-    }
-    file
-}
-
-/// Sync file: fdatasync if sync_data, else fsync.
-fn do_sync(file: &std::fs::File, sync_data: bool) {
-    if sync_data {
-        file.sync_data().expect("fdatasync failed");
-    } else {
-        file.sync_all().expect("fsync failed");
-    }
-}
-
-/// Estimate preallocation size using max record size.
-/// Over-allocates slightly but avoids extent metadata updates mid-benchmark.
-fn estimate_prealloc(args: &Args) -> u64 {
-    let max_record = 4 + 8 + args.max_record_size;
-    let per_write = if args.direct {
-        max_record.div_ceil(ALIGN) * ALIGN
-    } else {
-        max_record
-    };
-    let total_writes = args.writes_per_task + args.warmup;
-    (per_write * total_writes) as u64
-}
-
-struct TaskResult {
-    task_id: usize,
-    total_bytes: u64,
-    measured_bytes: u64,
-    elapsed: Duration,
-    latencies_us: Vec<u64>,
-    primary_latencies_us: Vec<u64>,
-    replica_latencies_us: Vec<u64>,
-}
-
-async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
-    use std::io::Write;
-
-    let path = args.dir.join(format!("wal-{task_id:04}.log"));
-    let prealloc = estimate_prealloc(args);
-    let mut file = open_direct(&path, args.direct, prealloc);
-
-    let replica_file = args.replica_dir.as_ref().map(|rd| {
-        let rpath = rd.join(format!("wal-{task_id:04}.log"));
-        std::sync::Arc::new(std::sync::Mutex::new(open_direct(&rpath, args.direct, prealloc)))
-    });
-
-    let mut rng = StdRng::from_entropy();
-    let mut total_bytes: u64 = 0;
-    let mut measured_bytes: u64 = 0;
-    let mut latencies_us = Vec::with_capacity(args.writes_per_task);
-    let max_record_raw = 4 + 8 + args.max_record_size;
-    let max_write_len = max_record_raw.div_ceil(ALIGN) * ALIGN;
-
-    // Pre-allocate payload and write buffers
-    let mut payload_buf = vec![0u8; args.max_record_size];
-    let mut record_buf = vec![0u8; max_write_len];
-    let mut abuf = if args.direct { Some(AlignedBuf::new(max_write_len)) } else { None };
-    let mut primary_latencies_us = Vec::with_capacity(if replica_file.is_some() { args.writes_per_task } else { 0 });
-    let mut replica_latencies_us = Vec::with_capacity(if replica_file.is_some() { args.writes_per_task } else { 0 });
-
-    let total_writes = args.warmup + args.writes_per_task;
-    let start = Instant::now();
-
-    for seq in 0..total_writes as u64 {
-        let payload_len = rng.r#gen_range(args.min_record_size..=args.max_record_size);
-        rng.fill_bytes(&mut payload_buf[..payload_len]);
-
-        let write_len;
-        if let Some(ref mut abuf) = abuf {
-            // O_DIRECT: build directly into aligned buffer
-            write_len = build_record_into(abuf.as_mut_slice(), seq, &payload_buf[..payload_len], true);
-
-            if let Some(ref replica_arc) = replica_file {
-                let replica_arc = replica_arc.clone();
-                let record_copy = abuf.as_slice(write_len).to_vec();
-                let sync_data = args.sync_data;
-
-                let t0 = Instant::now();
-
-                let replica_handle = tokio::spawn(async move {
-                    use std::io::Write;
-                    let t_replica = Instant::now();
-                    let mut rfile = replica_arc.lock().unwrap();
-                    rfile.write_all(&record_copy).expect("replica write failed");
-                    do_sync(&rfile, sync_data);
-                    t_replica.elapsed().as_micros() as u64
-                });
-
-                file.write_all(abuf.as_slice(write_len)).expect("write failed");
-                do_sync(&file, args.sync_data);
-                let primary_lat = t0.elapsed().as_micros() as u64;
-
-                let replica_lat = replica_handle.await.expect("replica task panicked");
-                let combined_lat = primary_lat.max(replica_lat);
-
-                if seq >= args.warmup as u64 {
-                    latencies_us.push(combined_lat);
-                    primary_latencies_us.push(primary_lat);
-                    replica_latencies_us.push(replica_lat);
-                    measured_bytes += write_len as u64;
-                }
-            } else {
-                let t0 = Instant::now();
-                file.write_all(abuf.as_slice(write_len)).expect("write failed");
-                do_sync(&file, args.sync_data);
-                let lat = t0.elapsed();
-                if seq >= args.warmup as u64 {
-                    latencies_us.push(lat.as_micros() as u64);
-                    measured_bytes += write_len as u64;
-                }
-            }
-        } else {
-            write_len = build_record_into(&mut record_buf, seq, &payload_buf[..payload_len], false);
-
-            if let Some(ref replica_arc) = replica_file {
-                let replica_arc = replica_arc.clone();
-                let record_copy = record_buf[..write_len].to_vec();
-                let sync_data = args.sync_data;
-
-                let t0 = Instant::now();
-
-                let replica_handle = tokio::spawn(async move {
-                    use std::io::Write;
-                    let t_replica = Instant::now();
-                    let mut rfile = replica_arc.lock().unwrap();
-                    rfile.write_all(&record_copy).expect("replica write failed");
-                    do_sync(&rfile, sync_data);
-                    t_replica.elapsed().as_micros() as u64
-                });
-
-                file.write_all(&record_buf[..write_len]).expect("write failed");
-                do_sync(&file, args.sync_data);
-                let primary_lat = t0.elapsed().as_micros() as u64;
-
-                let replica_lat = replica_handle.await.expect("replica task panicked");
-                let combined_lat = primary_lat.max(replica_lat);
-
-                if seq >= args.warmup as u64 {
-                    latencies_us.push(combined_lat);
-                    primary_latencies_us.push(primary_lat);
-                    replica_latencies_us.push(replica_lat);
-                    measured_bytes += write_len as u64;
-                }
-            } else {
-                let t0 = Instant::now();
-                file.write_all(&record_buf[..write_len]).expect("write failed");
-                do_sync(&file, args.sync_data);
-                let lat = t0.elapsed();
-                if seq >= args.warmup as u64 {
-                    latencies_us.push(lat.as_micros() as u64);
-                    measured_bytes += write_len as u64;
-                }
-            }
-        };
-
-        total_bytes += write_len as u64;
-    }
-
-    let elapsed = start.elapsed();
-
-    TaskResult {
-        task_id,
-        total_bytes,
-        measured_bytes,
-        elapsed,
-        latencies_us,
-        primary_latencies_us,
-        replica_latencies_us,
-    }
-}
-
-async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
-    let path = args.dir.join(format!("wal-{task_id:04}.log"));
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.create(true).truncate(true).write(true);
-    if args.direct {
-        opts.custom_flags(libc::O_DIRECT);
-    }
-    let mut file = opts.open(&path).await
-        .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
-
-    // Pre-allocate file space
-    {
-        use std::os::unix::io::AsRawFd;
-        let prealloc = estimate_prealloc(args);
-        if prealloc > 0 {
-            let fd = file.as_raw_fd();
-            let ret = unsafe { libc::fallocate(fd, 0, 0, prealloc as libc::off_t) };
-            if ret != 0 {
-                panic!("fallocate failed: {}", std::io::Error::last_os_error());
-            }
-        }
-    }
-
-    // Open replica file if COW mode is enabled
-    let mut replica_file = if let Some(ref rd) = args.replica_dir {
-        let rpath = rd.join(format!("wal-{task_id:04}.log"));
-        let mut ropts = tokio::fs::OpenOptions::new();
-        ropts.create(true).truncate(true).write(true);
-        if args.direct {
-            ropts.custom_flags(libc::O_DIRECT);
-        }
-        let rfile = ropts.open(&rpath).await
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", rpath.display()));
-        // Pre-allocate replica file
-        {
-            use std::os::unix::io::AsRawFd;
-            let prealloc = estimate_prealloc(args);
-            if prealloc > 0 {
-                let fd = rfile.as_raw_fd();
-                let ret = unsafe { libc::fallocate(fd, 0, 0, prealloc as libc::off_t) };
-                if ret != 0 {
-                    panic!("fallocate failed: {}", std::io::Error::last_os_error());
-                }
-            }
-        }
-        Some(rfile)
-    } else {
-        None
-    };
-
-    let mut rng = StdRng::from_entropy();
-    let mut total_bytes: u64 = 0;
-    let mut measured_bytes: u64 = 0;
-    let mut latencies_us = Vec::with_capacity(args.writes_per_task);
-    let max_record_raw = 4 + 8 + args.max_record_size;
-    let max_write_len = max_record_raw.div_ceil(ALIGN) * ALIGN;
-
-    let mut payload_buf = vec![0u8; args.max_record_size];
-    let mut record_buf = vec![0u8; max_write_len];
-    let mut abuf = if args.direct { Some(AlignedBuf::new(max_write_len)) } else { None };
-
-    let mut primary_latencies_us = Vec::with_capacity(if replica_file.is_some() { args.writes_per_task } else { 0 });
-    let mut replica_latencies_us = Vec::with_capacity(if replica_file.is_some() { args.writes_per_task } else { 0 });
-    let mut replica_abuf = if args.direct && replica_file.is_some() {
-        Some(AlignedBuf::new(max_write_len))
-    } else {
-        None
-    };
-    let mut replica_record_buf = if replica_file.is_some() && !args.direct { vec![0u8; max_write_len] } else { vec![] };
-
-    let total_writes = args.warmup + args.writes_per_task;
-    let start = Instant::now();
-
-    for seq in 0..total_writes as u64 {
-        let payload_len = rng.r#gen_range(args.min_record_size..=args.max_record_size);
-        rng.fill_bytes(&mut payload_buf[..payload_len]);
-
-        let write_len;
-        if let Some(ref mut abuf) = abuf {
-            write_len = build_record_into(abuf.as_mut_slice(), seq, &payload_buf[..payload_len], true);
-
-            if let (Some(rfile), Some(rabuf)) = (&mut replica_file, &mut replica_abuf) {
-                rabuf.as_mut_slice()[..write_len].copy_from_slice(abuf.as_slice(write_len));
-                let sync_data = args.sync_data;
-
-                let (primary_lat, replica_lat) = tokio::join!(
-                    async {
-                        let t = Instant::now();
-                        file.write_all(abuf.as_slice(write_len)).await.expect("write failed");
-                        if sync_data { file.sync_data().await.expect("fdatasync failed"); }
-                        else { file.sync_all().await.expect("fsync failed"); }
-                        t.elapsed().as_micros() as u64
-                    },
-                    async {
-                        let t = Instant::now();
-                        rfile.write_all(rabuf.as_slice(write_len)).await.expect("replica write failed");
-                        if sync_data { rfile.sync_data().await.expect("replica fdatasync failed"); }
-                        else { rfile.sync_all().await.expect("replica fsync failed"); }
-                        t.elapsed().as_micros() as u64
-                    }
-                );
-
-                if seq >= args.warmup as u64 {
-                    primary_latencies_us.push(primary_lat);
-                    replica_latencies_us.push(replica_lat);
-                    latencies_us.push(primary_lat.max(replica_lat));
-                    measured_bytes += write_len as u64;
-                }
-            } else {
-                let t0 = Instant::now();
-                file.write_all(abuf.as_slice(write_len)).await.expect("write failed");
-                if args.sync_data {
-                    file.sync_data().await.expect("fdatasync failed");
-                } else {
-                    file.sync_all().await.expect("fsync failed");
-                }
-                let lat = t0.elapsed();
-                if seq >= args.warmup as u64 {
-                    latencies_us.push(lat.as_micros() as u64);
-                    measured_bytes += write_len as u64;
-                }
-            }
-        } else {
-            write_len = build_record_into(&mut record_buf, seq, &payload_buf[..payload_len], false);
-
-            if let Some(ref mut rfile) = replica_file {
-                replica_record_buf[..write_len].copy_from_slice(&record_buf[..write_len]);
-                let sync_data = args.sync_data;
-
-                let (primary_lat, replica_lat) = tokio::join!(
-                    async {
-                        let t = Instant::now();
-                        file.write_all(&record_buf[..write_len]).await.expect("write failed");
-                        if sync_data { file.sync_data().await.expect("fdatasync failed"); }
-                        else { file.sync_all().await.expect("fsync failed"); }
-                        t.elapsed().as_micros() as u64
-                    },
-                    async {
-                        let t = Instant::now();
-                        rfile.write_all(&replica_record_buf[..write_len]).await.expect("replica write failed");
-                        if sync_data { rfile.sync_data().await.expect("replica fdatasync failed"); }
-                        else { rfile.sync_all().await.expect("replica fsync failed"); }
-                        t.elapsed().as_micros() as u64
-                    }
-                );
-
-                if seq >= args.warmup as u64 {
-                    primary_latencies_us.push(primary_lat);
-                    replica_latencies_us.push(replica_lat);
-                    latencies_us.push(primary_lat.max(replica_lat));
-                    measured_bytes += write_len as u64;
-                }
-            } else {
-                let t0 = Instant::now();
-                file.write_all(&record_buf[..write_len]).await.expect("write failed");
-                if args.sync_data {
-                    file.sync_data().await.expect("fdatasync failed");
-                } else {
-                    file.sync_all().await.expect("fsync failed");
-                }
-                let lat = t0.elapsed();
-                if seq >= args.warmup as u64 {
-                    latencies_us.push(lat.as_micros() as u64);
-                    measured_bytes += write_len as u64;
-                }
-            }
-        };
-
-        total_bytes += write_len as u64;
-    }
-
-    let elapsed = start.elapsed();
-
-    TaskResult {
-        task_id,
-        total_bytes,
-        measured_bytes,
-        elapsed,
-        latencies_us,
-        primary_latencies_us,
-        replica_latencies_us,
-    }
-}
-
-async fn writer_task_channel(
-    args: &Args,
-    task_id: usize,
-    io_core: Option<CoreId>,
-) -> TaskResult {
-    let path = args.dir.join(format!("wal-{task_id:04}.log"));
-    let direct = args.direct;
-    let sync_data = args.sync_data;
-    let prealloc = estimate_prealloc(args);
-
-    let max_record_raw = 4 + 8 + args.max_record_size;
-    let max_write_len = max_record_raw.div_ceil(ALIGN) * ALIGN;
-
-    // Double-buffer scheme: sender fills a buffer and sends it to IO thread,
-    // IO thread writes it and sends the buffer back for reuse. No per-write allocation.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(1);
-    let (ret_tx, mut ret_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(1);
-
-    let io_thread = std::thread::spawn(move || {
-        if let Some(core) = io_core {
-            core_affinity::set_for_current(core);
-        }
-        use std::io::Write;
-
-        let mut file = open_direct(&path, direct, prealloc);
-        let mut abuf = if direct { Some(AlignedBuf::new(max_write_len)) } else { None };
-
-        while let Ok((buf, len)) = rx.recv() {
-            let t = Instant::now();
-            if let Some(ref mut abuf) = abuf {
-                abuf.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
-                file.write_all(abuf.as_slice(len)).expect("write failed");
-            } else {
-                file.write_all(&buf[..len]).expect("write failed");
-            }
-            do_sync(&file, sync_data);
-            let lat = t.elapsed().as_micros() as u64;
-            if ret_tx.blocking_send((buf, lat)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let replica_channels = args.replica_dir.as_ref().map(|rd| {
-        let rpath = rd.join(format!("wal-{task_id:04}.log"));
-        let direct_r = direct;
-        let sync_data_r = sync_data;
-        let prealloc_r = prealloc;
-        let max_write_len_r = max_write_len;
-
-        let (rtx, rrx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(1);
-        let (rret_tx, rret_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(1);
-
-        let replica_io_core = io_core; // same pinning strategy
-        let replica_thread = std::thread::spawn(move || {
-            if let Some(core) = replica_io_core {
-                core_affinity::set_for_current(core);
-            }
-            use std::io::Write;
-
-            let mut file = open_direct(&rpath, direct_r, prealloc_r);
-            let mut abuf = if direct_r { Some(AlignedBuf::new(max_write_len_r)) } else { None };
-
-            while let Ok((buf, len)) = rrx.recv() {
-                let t = Instant::now();
-                if let Some(ref mut abuf) = abuf {
-                    abuf.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
-                    file.write_all(abuf.as_slice(len)).expect("replica write failed");
-                } else {
-                    file.write_all(&buf[..len]).expect("replica write failed");
-                }
-                do_sync(&file, sync_data_r);
-                let lat = t.elapsed().as_micros() as u64;
-                if rret_tx.blocking_send((buf, lat)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        (rtx, rret_rx, replica_thread)
-    });
-    let mut replica_channels = replica_channels;
-
-    let mut rng = StdRng::from_entropy();
-    let mut total_bytes: u64 = 0;
-    let mut measured_bytes: u64 = 0;
-    let mut latencies_us = Vec::with_capacity(args.writes_per_task);
-    let mut primary_latencies_us = Vec::with_capacity(if replica_channels.is_some() { args.writes_per_task } else { 0 });
-    let mut replica_latencies_us = Vec::with_capacity(if replica_channels.is_some() { args.writes_per_task } else { 0 });
-    let mut payload_buf = vec![0u8; args.max_record_size];
-    // Two pre-allocated buffers for double-buffering
-    let mut send_buf = vec![0u8; max_write_len];
-    let mut spare_buf = Some(vec![0u8; max_write_len]);
-
-    let total_writes = args.warmup + args.writes_per_task;
-    let start = Instant::now();
-
-    for seq in 0..total_writes as u64 {
-        let payload_len = rng.r#gen_range(args.min_record_size..=args.max_record_size);
-        rng.fill_bytes(&mut payload_buf[..payload_len]);
-        let write_len = build_record_into(&mut send_buf, seq, &payload_buf[..payload_len], direct);
-        total_bytes += write_len as u64;
-
-        if let Some((ref rtx, ref mut rret_rx, _)) = replica_channels {
-            // Copy record to replica buffer BEFORE sending primary (which moves send_buf)
-            let mut replica_buf = spare_buf.take().unwrap_or_else(|| vec![0u8; max_write_len]);
-            replica_buf[..write_len].copy_from_slice(&send_buf[..write_len]);
-            rtx.send((replica_buf, write_len)).expect("replica send failed");
-
-            // Send to primary
-            tx.send((send_buf, write_len)).expect("send failed");
-
-            // Await both
-            let (primary_ret, primary_lat) = ret_rx.recv().await.expect("recv failed");
-            let (replica_ret, replica_lat) = rret_rx.recv().await.expect("replica recv failed");
-
-            send_buf = primary_ret;
-            spare_buf = Some(replica_ret);
-
-            let combined_lat = primary_lat.max(replica_lat);
-
-            if seq >= args.warmup as u64 {
-                latencies_us.push(combined_lat);
-                primary_latencies_us.push(primary_lat);
-                replica_latencies_us.push(replica_lat);
-                measured_bytes += write_len as u64;
-            }
-        } else {
-            tx.send((send_buf, write_len)).expect("send failed");
-            let (ret, primary_lat) = ret_rx.recv().await.expect("recv failed");
-            send_buf = ret;
-
-            if seq >= args.warmup as u64 {
-                latencies_us.push(primary_lat);
-                measured_bytes += write_len as u64;
-            }
-        }
-    }
-
-    drop(tx);
-    drop(spare_buf.take());
-    io_thread.join().expect("io thread panicked");
-
-    if let Some((rtx, _, replica_thread)) = replica_channels {
-        drop(rtx);
-        replica_thread.join().expect("replica io thread panicked");
-    }
-
-    let elapsed = start.elapsed();
-
-    TaskResult {
-        task_id,
-        total_bytes,
-        measured_bytes,
-        elapsed,
-        latencies_us,
-        primary_latencies_us,
-        replica_latencies_us,
-    }
-}
+use common::*;
 
 fn print_histogram(label: &str, hist: &Histogram<u64>) {
     println!("Fsync latency{} (us):", label);
@@ -755,6 +69,7 @@ async fn run(args: Args) {
         IoMode::Std => "std",
         IoMode::Tokio => "tokio",
         IoMode::Channel => "channel",
+        IoMode::Thread => "thread",
     };
 
     let worker_cores_str = args.worker_cores.as_deref().unwrap_or("all");
@@ -765,7 +80,7 @@ async fn run(args: Args) {
     };
 
     println!(
-        "Starting WAL sync-write benchmark\n  dir:            {}\n  concurrency:    {}\n  writes/task:    {}\n  warmup/task:    {}\n  record size:    {}..{} bytes\n  io mode:        {}\n  O_DIRECT:       {}\n  sync mode:      {}\n  worker cores:   {}\n  io cores:       {}\n  COW mode:       {}",
+        "Starting WAL sync-write benchmark\n  dir:            {}\n  concurrency:    {}\n  writes/task:    {}\n  warmup/task:    {}\n  record size:    {}..{} bytes\n  io mode:        {}\n  O_DIRECT:       {}\n  sync mode:      {}\n  worker cores:   {}\n  io cores:       {}\n  COW mode:       {}\n  spread dirs:    {}",
         args.dir.display(),
         args.concurrency,
         args.writes_per_task,
@@ -778,40 +93,71 @@ async fn run(args: Args) {
         worker_cores_str,
         io_cores_str,
         cow_str,
+        args.spread_dirs,
     );
 
     // Parse io_cores once, share across tasks
-    let io_cores: Option<Vec<CoreId>> = args.io_cores.as_ref().map(|s| {
+    let io_cores: Option<Vec<core_affinity::CoreId>> = args.io_cores.as_ref().map(|s| {
         parse_cores(s).expect("invalid --io-cores")
     });
+
+    // Pre-create per-task subdirectories when --spread-dirs is enabled
+    if args.spread_dirs {
+        for id in 0..args.concurrency {
+            let subdir = args.dir.join(format!("sub-{id:04}"));
+            std::fs::create_dir_all(&subdir)
+                .unwrap_or_else(|e| panic!("failed to create {}: {e}", subdir.display()));
+            if let Some(ref rd) = args.replica_dir {
+                let rsubdir = rd.join(format!("sub-{id:04}"));
+                std::fs::create_dir_all(&rsubdir)
+                    .unwrap_or_else(|e| panic!("failed to create {}: {e}", rsubdir.display()));
+            }
+        }
+    }
 
     let args = std::sync::Arc::new(args);
     let io_cores = std::sync::Arc::new(io_cores);
     let wall_start = Instant::now();
 
-    let mut handles = Vec::with_capacity(args.concurrency);
-    for id in 0..args.concurrency {
-        let args = args.clone();
-        let io_cores = io_cores.clone();
-        match args.io_mode {
-            IoMode::Std => {
-                handles.push(tokio::spawn(async move { writer_task_std(&args, id).await }));
-            }
-            IoMode::Tokio => {
-                handles.push(tokio::spawn(async move { writer_task_tokio(&args, id).await }));
-            }
-            IoMode::Channel => {
-                let io_core = io_cores.as_ref().as_ref().map(|c| c[id % c.len()]);
-                handles.push(tokio::spawn(async move {
-                    writer_task_channel(&args, id, io_core).await
-                }));
+    let mut results = Vec::with_capacity(args.concurrency);
+
+    if matches!(args.io_mode, IoMode::Thread) {
+        let mut thread_handles = Vec::with_capacity(args.concurrency);
+        for id in 0..args.concurrency {
+            let args = args.clone();
+            let io_cores = io_cores.clone();
+            let io_core = io_cores.as_ref().as_ref().map(|c| c[id % c.len()]);
+            thread_handles.push(std::thread::spawn(move || {
+                mode_thread::writer_task_thread(&args, id, io_core)
+            }));
+        }
+        for h in thread_handles {
+            results.push(h.join().expect("thread panicked"));
+        }
+    } else {
+        let mut handles = Vec::with_capacity(args.concurrency);
+        for id in 0..args.concurrency {
+            let args = args.clone();
+            let io_cores = io_cores.clone();
+            match args.io_mode {
+                IoMode::Std => {
+                    handles.push(tokio::spawn(async move { mode_std::writer_task_std(&args, id).await }));
+                }
+                IoMode::Tokio => {
+                    handles.push(tokio::spawn(async move { mode_tokio::writer_task_tokio(&args, id).await }));
+                }
+                IoMode::Channel => {
+                    let io_core = io_cores.as_ref().as_ref().map(|c| c[id % c.len()]);
+                    handles.push(tokio::spawn(async move {
+                        mode_channel::writer_task_channel(&args, id, io_core).await
+                    }));
+                }
+                IoMode::Thread => unreachable!(),
             }
         }
-    }
-
-    let mut results = Vec::with_capacity(args.concurrency);
-    for h in handles {
-        results.push(h.await.expect("task panicked"));
+        for h in handles {
+            results.push(h.await.expect("task panicked"));
+        }
     }
 
     let wall_elapsed = wall_start.elapsed();
@@ -871,19 +217,44 @@ async fn run(args: Args) {
         );
     }
 
+    if args.trace_sync {
+        use std::io::Write;
+        let trace_path = args.dir.join("sync-trace.tsv");
+        let mut f = std::fs::File::create(&trace_path)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", trace_path.display()));
+        writeln!(f, "task\tsource\tstart_ns\tend_ns").unwrap();
+        for r in &results {
+            for ev in &r.primary_trace {
+                writeln!(f, "{}\tprimary\t{}\t{}", r.task_id, ev.start_ns, ev.end_ns).unwrap();
+            }
+            for ev in &r.replica_trace {
+                writeln!(f, "{}\treplica\t{}\t{}", r.task_id, ev.start_ns, ev.end_ns).unwrap();
+            }
+        }
+        println!("\nSync trace written to {}", trace_path.display());
+    }
+
     if args.cleanup {
         println!("\nCleaning up WAL files...");
         for id in 0..args.concurrency {
-            let path = args.dir.join(format!("wal-{id:04}.log"));
+            let path = wal_path(&args.dir, id, args.spread_dirs);
             if let Err(e) = std::fs::remove_file(&path) {
                 eprintln!("  warning: failed to remove {}: {e}", path.display());
+            }
+            if args.spread_dirs {
+                let subdir = args.dir.join(format!("sub-{id:04}"));
+                let _ = std::fs::remove_dir(&subdir);
             }
         }
         if let Some(ref replica_dir) = args.replica_dir {
             for id in 0..args.concurrency {
-                let path = replica_dir.join(format!("wal-{id:04}.log"));
+                let path = wal_path(replica_dir, id, args.spread_dirs);
                 if let Err(e) = std::fs::remove_file(&path) {
                     eprintln!("  warning: failed to remove {}: {e}", path.display());
+                }
+                if args.spread_dirs {
+                    let subdir = replica_dir.join(format!("sub-{id:04}"));
+                    let _ = std::fs::remove_dir(&subdir);
                 }
             }
         }
