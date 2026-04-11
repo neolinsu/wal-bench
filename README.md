@@ -4,6 +4,19 @@ A Rust benchmark that evaluates WAL (Write-Ahead Log) (sync-) write performance 
 
 Each concurrent task sequentially appends variable-sized records to its own file, calling fsync/fdatasync after every write.
 
+## Why
+
+WAL write functioning everywhere is trivial: append, fsync, repeat. But fsync latency under concurrency is unpredictable.
+
+- **Thread model matters.** Tokio coroutines, channel-bridged I/O threads, and bare kernel threads issue the same syscalls but produce different latency distributions -- the scheduling layer changes how flushes overlap at the device.
+- **Unsynchronized flushes fight.** Two free-running threads doing fdatasync can be 50% slower than two lockstepped ones. Zero inter-sync gap means permanent device-queue contention.
+- **The filesystem has opinions.** XFS AG locks, journal log forces, inode placement -- all invisible from userspace, all serialize your "parallel" writes.
+- **Cores aren't free.** Affinity, IPIs, and cache topology add microseconds per fsync. Multiply by thousands of writes.
+
+Tools, like `fio` and `dd`, benchmarks I/O, not the concurrency patterns WAL applications actually use. `wal-bench` attempts to isolate each parts, thread model, core affinity, sync pattern, filesystem or just block dev. Hope we can measure what actually moves tail latency.
+
+
+*For now (Apr.2026), Claude isn't yet great at investigating what behind these performance mysteries.*
 ## Build
 
 ```bash
