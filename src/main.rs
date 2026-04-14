@@ -12,7 +12,7 @@ use hdrhistogram::Histogram;
 use common::*;
 
 fn print_histogram(label: &str, hist: &Histogram<u64>) {
-    println!("Fsync latency{} (us):", label);
+    println!("WAL&Fsync latency{} (us):", label);
     println!("  min:    {:>10}", hist.min());
     println!("  p50:    {:>10}", hist.value_at_percentile(50.0));
     println!("  p90:    {:>10}", hist.value_at_percentile(90.0));
