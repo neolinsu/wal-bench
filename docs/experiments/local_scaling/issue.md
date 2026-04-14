@@ -13,7 +13,8 @@
 - Concurrency: 1 through 5, with `--worker-cores` matching concurrency
 - Storage: local NVMe SSD (Samsung SSD 9100 PRO 2TB)
 - NVMe Queue [Queue Number (Core IDs)]: 0 (0,1,16), 1(2, 3, 18), 2(4, 20), 3(5, 21), 4(6, 22), ...
-
+- 6.18.16-200.fc43.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Mar  4 19:13:32 UTC 2026 x86_64 GNU/Linux
+- XFS File System
 
 ## Observation
 
