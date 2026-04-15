@@ -79,8 +79,12 @@ p50 at c=1 is higher (~1,716 μs vs 852 μs)
 > By  the time write(2) (and similar) return, the output data has been transferred to the underlying hardware, along with any file metadata that would be required to retrieve that data (i.e., as though each write(2) was followed by a call to fdatasync(2)). 
 
 
-## TODO
-* verify whether NVMe FLUSH is device-global, which cause the fdatasync p50 latency scales linearly.
+## `FLUSH` is namespace global
+* from NVM Express Base Specification: Revision 2.3
+
+> The Flush command is used to request that the contents of volatile write cache be made non-volatile.
+>
+> If a volatile write cache is enabled (refer to section 5.2.26.1.4), then the Flush command shall commit data and metadata associated with the specified namespace(s) to non-volatile storage media.
 
 ## References
 
