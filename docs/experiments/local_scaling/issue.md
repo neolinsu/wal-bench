@@ -62,10 +62,7 @@ p50 at c=1 is higher (~1,716 μs vs 852 μs)
 
 ![fdatasync vs dsync scaling](comparison.png)
 
-## References
 
-- [linux/block/blk-flush.c](https://github.com/torvalds/linux/blob/master/block/blk-flush.c) -- flush state machine serialization
-- [Kernel docs: writeback cache control](https://docs.kernel.org/block/writeback_cache_control.html) -- REQ_PREFLUSH vs REQ_FUA
 
 ## PostgreSQL WAL Implementation Approach ([972c14f](https://github.com/postgres/postgres/tree/972c14fb9134fdfd76ea6ebcf98a55a945bbc988))
 
@@ -76,6 +73,16 @@ p50 at c=1 is higher (~1,716 μs vs 852 μs)
 * open_sync: bypass fsync syscall in [issue_xlog_fsync](https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/backend/access/transam/xlog.c#L9374)
 * open_datasync: bypass fsync syscall in [issue_xlog_fsync](https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/backend/access/transam/xlog.c#L9374)
 
+## man `open` `O_DSYNC`
+> Write operations on the file will complete according to the requirements of synchronized I/O data integrity completion.
+>
+> By  the time write(2) (and similar) return, the output data has been transferred to the underlying hardware, along with any file metadata that would be required to retrieve that data (i.e., as though each write(2) was followed by a call to fdatasync(2)). 
+
+
 ## TODO
-* verify whether O_DSYNC ensure FUA
-* verify whether NVMe FLUSH is device-global
+* verify whether NVMe FLUSH is device-global, which cause the fdatasync p50 latency scales linearly.
+
+## References
+
+- [linux/block/blk-flush.c](https://github.com/torvalds/linux/blob/master/block/blk-flush.c) -- flush state machine serialization
+- [Kernel docs: writeback cache control](https://docs.kernel.org/block/writeback_cache_control.html) -- REQ_PREFLUSH vs REQ_FUA
