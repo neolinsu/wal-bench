@@ -6,12 +6,23 @@ use tokio::io::AsyncWriteExt;
 
 use crate::common::*;
 
+async fn do_sync_tokio(file: &tokio::fs::File, sync_mode: SyncMode) {
+    match sync_mode {
+        SyncMode::Fsync => file.sync_all().await.expect("fsync failed"),
+        SyncMode::Fdatasync => file.sync_data().await.expect("fdatasync failed"),
+        SyncMode::Dsync | SyncMode::None => {}
+    }
+}
+
 pub async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
     let path = wal_path(&args.dir, task_id, args.spread_dirs);
     let mut opts = tokio::fs::OpenOptions::new();
     opts.create(true).truncate(true).write(true);
-    if args.direct {
-        opts.custom_flags(libc::O_DIRECT);
+    {
+        let mut flags = 0;
+        if args.direct { flags |= libc::O_DIRECT; }
+        if args.sync_mode == SyncMode::Dsync { flags |= libc::O_DSYNC; }
+        if flags != 0 { opts.custom_flags(flags); }
     }
     let mut file = opts.open(&path).await
         .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
@@ -34,8 +45,11 @@ pub async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
         let rpath = wal_path(rd, task_id, args.spread_dirs);
         let mut ropts = tokio::fs::OpenOptions::new();
         ropts.create(true).truncate(true).write(true);
-        if args.direct {
-            ropts.custom_flags(libc::O_DIRECT);
+        {
+            let mut flags = 0;
+            if args.direct { flags |= libc::O_DIRECT; }
+            if args.sync_mode == SyncMode::Dsync { flags |= libc::O_DSYNC; }
+            if flags != 0 { ropts.custom_flags(flags); }
         }
         let rfile = ropts.open(&rpath).await
             .unwrap_or_else(|e| panic!("failed to open {}: {e}", rpath.display()));
@@ -89,21 +103,19 @@ pub async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
 
             if let (Some(rfile), Some(rabuf)) = (&mut replica_file, &mut replica_abuf) {
                 rabuf.as_mut_slice()[..write_len].copy_from_slice(abuf.as_slice(write_len));
-                let sync_data = args.sync_data;
+                let sync_mode = args.sync_mode;
 
                 let (primary_lat, replica_lat) = tokio::join!(
                     async {
                         let t = Instant::now();
                         file.write_all(abuf.as_slice(write_len)).await.expect("write failed");
-                        if sync_data { file.sync_data().await.expect("fdatasync failed"); }
-                        else { file.sync_all().await.expect("fsync failed"); }
+                        do_sync_tokio(&file, sync_mode).await;
                         t.elapsed().as_micros() as u64
                     },
                     async {
                         let t = Instant::now();
                         rfile.write_all(rabuf.as_slice(write_len)).await.expect("replica write failed");
-                        if sync_data { rfile.sync_data().await.expect("replica fdatasync failed"); }
-                        else { rfile.sync_all().await.expect("replica fsync failed"); }
+                        do_sync_tokio(&rfile, sync_mode).await;
                         t.elapsed().as_micros() as u64
                     }
                 );
@@ -117,11 +129,7 @@ pub async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
             } else {
                 let t0 = Instant::now();
                 file.write_all(abuf.as_slice(write_len)).await.expect("write failed");
-                if args.sync_data {
-                    file.sync_data().await.expect("fdatasync failed");
-                } else {
-                    file.sync_all().await.expect("fsync failed");
-                }
+                do_sync_tokio(&file, args.sync_mode).await;
                 let lat = t0.elapsed();
                 if seq >= args.warmup as u64 {
                     latencies_us.push(lat.as_micros() as u64);
@@ -133,21 +141,19 @@ pub async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
 
             if let Some(ref mut rfile) = replica_file {
                 replica_record_buf[..write_len].copy_from_slice(&record_buf[..write_len]);
-                let sync_data = args.sync_data;
+                let sync_mode = args.sync_mode;
 
                 let (primary_lat, replica_lat) = tokio::join!(
                     async {
                         let t = Instant::now();
                         file.write_all(&record_buf[..write_len]).await.expect("write failed");
-                        if sync_data { file.sync_data().await.expect("fdatasync failed"); }
-                        else { file.sync_all().await.expect("fsync failed"); }
+                        do_sync_tokio(&file, sync_mode).await;
                         t.elapsed().as_micros() as u64
                     },
                     async {
                         let t = Instant::now();
                         rfile.write_all(&replica_record_buf[..write_len]).await.expect("replica write failed");
-                        if sync_data { rfile.sync_data().await.expect("replica fdatasync failed"); }
-                        else { rfile.sync_all().await.expect("replica fsync failed"); }
+                        do_sync_tokio(&rfile, sync_mode).await;
                         t.elapsed().as_micros() as u64
                     }
                 );
@@ -161,11 +167,7 @@ pub async fn writer_task_tokio(args: &Args, task_id: usize) -> TaskResult {
             } else {
                 let t0 = Instant::now();
                 file.write_all(&record_buf[..write_len]).await.expect("write failed");
-                if args.sync_data {
-                    file.sync_data().await.expect("fdatasync failed");
-                } else {
-                    file.sync_all().await.expect("fsync failed");
-                }
+                do_sync_tokio(&file, args.sync_mode).await;
                 let lat = t0.elapsed();
                 if seq >= args.warmup as u64 {
                     latencies_us.push(lat.as_micros() as u64);

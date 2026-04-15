@@ -89,7 +89,12 @@ async fn run(args: Args) {
         args.max_record_size,
         mode_str,
         args.direct,
-        if args.sync_data { "fdatasync" } else { "fsync" },
+        match args.sync_mode {
+            SyncMode::Fsync => "fsync",
+            SyncMode::Fdatasync => "fdatasync",
+            SyncMode::Dsync => "O_DSYNC (FUA)",
+            SyncMode::None => "none",
+        },
         worker_cores_str,
         io_cores_str,
         cow_str,

@@ -23,13 +23,13 @@ pub fn writer_task_thread(
 
     let path = wal_path(&args.dir, task_id, args.spread_dirs);
     let direct = args.direct;
-    let sync_data = args.sync_data;
+    let sync_mode = args.sync_mode;
     let trace_sync = args.trace_sync;
     let prealloc = estimate_prealloc(args);
     let max_record_raw = 4 + 8 + args.max_record_size;
     let max_write_len = max_record_raw.div_ceil(ALIGN) * ALIGN;
 
-    let mut file = open_direct(&path, direct, prealloc);
+    let mut file = open_direct(&path, direct, sync_mode, prealloc);
     let mut abuf = if direct { Some(AlignedBuf::new(max_write_len)) } else { None };
     let mut record_buf = vec![0u8; max_write_len];
 
@@ -40,7 +40,7 @@ pub fn writer_task_thread(
         let (ret_tx, ret_rx) = std::sync::mpsc::sync_channel::<u64>(0);
         let replica_core = io_core;
         let direct_r = direct;
-        let sync_data_r = sync_data;
+        let sync_mode_r = sync_mode;
         let trace_r = trace_sync;
         let t0 = Instant::now();
 
@@ -48,7 +48,7 @@ pub fn writer_task_thread(
             if let Some(core) = replica_core {
                 core_affinity::set_for_current(core);
             }
-            let mut rfile = open_direct(&rpath, direct_r, prealloc);
+            let mut rfile = open_direct(&rpath, direct_r, sync_mode_r, prealloc);
             let mut rabuf = if direct_r { Some(AlignedBuf::new(max_write_len)) } else { None };
             let mut trace = Vec::new();
 
@@ -60,7 +60,7 @@ pub fn writer_task_thread(
                 } else {
                     rfile.write_all(&buf[..len]).expect("replica write failed");
                 }
-                do_sync(&rfile, sync_data_r);
+                do_sync(&rfile, sync_mode_r);
                 let end = Instant::now();
                 let lat = end.duration_since(t).as_micros() as u64;
                 if trace_r {
@@ -118,7 +118,7 @@ pub fn writer_task_thread(
         } else {
             file.write_all(&record_buf[..write_len]).expect("write failed");
         }
-        do_sync(&file, sync_data);
+        do_sync(&file, sync_mode);
         let end = Instant::now();
         let primary_lat = end.duration_since(t).as_micros() as u64;
 

@@ -80,9 +80,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub direct: bool,
 
-    /// Use fdatasync instead of fsync (skip metadata sync)
-    #[arg(long, default_value_t = false)]
-    pub sync_data: bool,
+    /// Sync mode: fsync, fdatasync, dsync (O_DSYNC on open, no explicit sync), none (no sync)
+    #[arg(long, default_value = "fsync")]
+    pub sync_mode: SyncMode,
 
     /// Remove WAL files after benchmark completes
     #[arg(long, default_value_t = false)]
@@ -107,6 +107,18 @@ pub enum IoMode {
     Tokio,
     Channel,
     Thread,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SyncMode {
+    /// fsync after every write
+    Fsync,
+    /// fdatasync after every write (skip metadata sync)
+    Fdatasync,
+    /// O_DSYNC on open -- kernel issues FUA per write, no explicit sync call
+    Dsync,
+    /// No sync at all (baseline measurement)
+    None,
 }
 
 /// Compute WAL file path. With `spread_dirs`, each task gets its own subdirectory
@@ -179,15 +191,22 @@ impl Drop for AlignedBuf {
 unsafe impl Send for AlignedBuf {}
 unsafe impl Sync for AlignedBuf {}
 
-/// Open a file with optional O_DIRECT, returning a std::fs::File.
+/// Open a file with optional O_DIRECT and O_DSYNC, returning a std::fs::File.
 /// Pre-allocates space so that fdatasync doesn't need to update extents/size.
-pub fn open_direct(path: &std::path::Path, direct: bool, prealloc_bytes: u64) -> std::fs::File {
+pub fn open_direct(path: &std::path::Path, direct: bool, sync_mode: SyncMode, prealloc_bytes: u64) -> std::fs::File {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).truncate(true).write(true);
+    let mut flags = 0;
     if direct {
-        opts.custom_flags(libc::O_DIRECT);
+        flags |= libc::O_DIRECT;
+    }
+    if sync_mode == SyncMode::Dsync {
+        flags |= libc::O_DSYNC;
+    }
+    if flags != 0 {
+        opts.custom_flags(flags);
     }
     let file = opts.open(path)
         .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
@@ -202,12 +221,13 @@ pub fn open_direct(path: &std::path::Path, direct: bool, prealloc_bytes: u64) ->
     file
 }
 
-/// Sync file: fdatasync if sync_data, else fsync.
-pub fn do_sync(file: &std::fs::File, sync_data: bool) {
-    if sync_data {
-        file.sync_data().expect("fdatasync failed");
-    } else {
-        file.sync_all().expect("fsync failed");
+/// Sync file according to the chosen sync mode.
+/// Dsync and None are no-ops (durability handled by O_DSYNC or skipped).
+pub fn do_sync(file: &std::fs::File, sync_mode: SyncMode) {
+    match sync_mode {
+        SyncMode::Fsync => file.sync_all().expect("fsync failed"),
+        SyncMode::Fdatasync => file.sync_data().expect("fdatasync failed"),
+        SyncMode::Dsync | SyncMode::None => {}
     }
 }
 

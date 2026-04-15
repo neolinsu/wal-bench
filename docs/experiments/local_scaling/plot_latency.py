@@ -1,33 +1,92 @@
+#!/usr/bin/env python3
+"""Plot normalized latency scaling from wal-bench log files.
+
+Usage:
+    python plot_latency.py fdatasync_latency.logs
+    python plot_latency.py fdatasync_latency.logs dsync_latency.logs
+"""
+
+import re
+import sys
+import os
+
 import matplotlib.pyplot as plt
 
-concurrency = [1, 2, 3, 4, 5]
 
-p50   = [852, 1536, 2243, 3283, 4259]
-p90   = [2315, 3441, 4719, 6039, 6839]
-p99   = [2533, 4779, 6039, 7963, 9279]
-p999  = [4991, 6627, 6635, 11143, 11263]
+def parse_logs(path):
+    """Parse a wal-bench latency log file into {concurrency: {percentile: value}}."""
+    data = {}
+    current_c = None
+    with open(path) as f:
+        for line in f:
+            m = re.match(r"^(\d+):", line)
+            if m:
+                current_c = int(m.group(1))
+                data[current_c] = {}
+                continue
+            m = re.match(r"^\s+(min|p50|p90|p99|p99\.9|max):\s+(\d+)", line)
+            if m and current_c is not None:
+                data[current_c][m.group(1)] = int(m.group(2))
+    return data
 
-# Normalize each percentile by its value at c=1
-p50_norm  = [v / p50[0]  for v in p50]
-p90_norm  = [v / p90[0]  for v in p90]
-p99_norm  = [v / p99[0]  for v in p99]
-p999_norm = [v / p999[0] for v in p999]
 
-fig, ax = plt.subplots(figsize=(8, 5))
+def plot_one(ax, data, label_prefix=""):
+    """Plot normalized percentiles for one dataset."""
+    concurrency = sorted(data.keys())
+    percentiles = ["p50", "p90", "p99", "p99.9"]
+    markers = ["o", "s", "^", "D"]
 
-ax.plot(concurrency, p50_norm,  "o-", label="p50",   linewidth=2)
-ax.plot(concurrency, p90_norm,  "s-", label="p90",   linewidth=2)
-ax.plot(concurrency, p99_norm,  "^-", label="p99",   linewidth=2)
-ax.plot(concurrency, p999_norm, "D-", label="p99.9", linewidth=2)
-ax.plot(concurrency, concurrency, "k--", label="y = x (linear)", linewidth=1, alpha=0.5)
+    for pct, marker in zip(percentiles, markers):
+        values = [data[c][pct] for c in concurrency]
+        base = values[0]
+        normed = [v / base for v in values]
+        label = f"{label_prefix}{pct}" if label_prefix else pct
+        ax.plot(concurrency, normed, f"{marker}-", label=label, linewidth=2)
 
-ax.set_xlabel("Concurrency")
-ax.set_ylabel("Normalized latency (× value at c=1)")
-ax.set_title("fdatasync latency scaling (normalized, local SSD, std mode, 512B O_DIRECT)")
-ax.set_xticks(concurrency)
-ax.legend()
-ax.grid(True, alpha=0.3)
+    return concurrency
 
-fig.tight_layout()
-fig.savefig("/data/neolin/dev/nfs-west-east/docs/experiments/local_latency.png", dpi=150)
-print("Saved to docs/experiments/local_latency.png")
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <logs_file> [<logs_file> ...]", file=sys.stderr)
+        sys.exit(1)
+
+    log_files = sys.argv[1:]
+    single = len(log_files) == 1
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    all_concurrency = []
+
+    for path in log_files:
+        data = parse_logs(path)
+        name = os.path.splitext(os.path.basename(path))[0].replace("_latency", "").replace("_", " ")
+        prefix = "" if single else f"{name} "
+        c = plot_one(ax, data, label_prefix=prefix)
+        all_concurrency = c if len(c) > len(all_concurrency) else all_concurrency
+
+    ax.plot(all_concurrency, all_concurrency, "k--", label="y = x (linear)", linewidth=1, alpha=0.5)
+
+    ax.set_xlabel("Concurrency")
+    ax.set_ylabel("Normalized latency (x value at c=1)")
+    if single:
+        name = os.path.splitext(os.path.basename(log_files[0]))[0].replace("_latency", "").replace("_", " ")
+        ax.set_title(f"{name} latency scaling (normalized, local SSD, 512B O_DIRECT)")
+    else:
+        ax.set_title("Latency scaling comparison (normalized, local SSD, 512B O_DIRECT)")
+    ax.set_xticks(all_concurrency)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    # Output PNG: derive from first log file name
+    base = os.path.splitext(log_files[0])[0]
+    if not single:
+        base = os.path.join(os.path.dirname(log_files[0]), "comparison")
+    out = base + ".png"
+    fig.savefig(out, dpi=150)
+    print(f"Saved to {out}")
+
+
+if __name__ == "__main__":
+    main()

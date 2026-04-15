@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --release
-./target/release/wal-bench --dir /mnt/nfs/wal-test -c 8 -m channel --direct --sync-data
+./target/release/wal-bench --dir /mnt/nfs/wal-test -c 8 -m channel --direct --sync-mode fdatasync
 ```
 
 Rust edition 2024 -- `gen` is a reserved keyword; use `r#gen` when calling `rand::Rng` methods.

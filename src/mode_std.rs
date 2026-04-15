@@ -10,11 +10,11 @@ pub async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
 
     let path = wal_path(&args.dir, task_id, args.spread_dirs);
     let prealloc = estimate_prealloc(args);
-    let mut file = open_direct(&path, args.direct, prealloc);
+    let mut file = open_direct(&path, args.direct, args.sync_mode, prealloc);
 
     let replica_file = args.replica_dir.as_ref().map(|rd| {
         let rpath = wal_path(rd, task_id, args.spread_dirs);
-        std::sync::Arc::new(std::sync::Mutex::new(open_direct(&rpath, args.direct, prealloc)))
+        std::sync::Arc::new(std::sync::Mutex::new(open_direct(&rpath, args.direct, args.sync_mode, prealloc)))
     });
 
     let mut rng = StdRng::from_entropy();
@@ -46,7 +46,7 @@ pub async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
             if let Some(ref replica_arc) = replica_file {
                 let replica_arc = replica_arc.clone();
                 let record_copy = abuf.as_slice(write_len).to_vec();
-                let sync_data = args.sync_data;
+                let sync_mode = args.sync_mode;
 
                 let t0 = Instant::now();
 
@@ -55,12 +55,12 @@ pub async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
                     let t_replica = Instant::now();
                     let mut rfile = replica_arc.lock().unwrap();
                     rfile.write_all(&record_copy).expect("replica write failed");
-                    do_sync(&rfile, sync_data);
+                    do_sync(&rfile, sync_mode);
                     t_replica.elapsed().as_micros() as u64
                 });
 
                 file.write_all(abuf.as_slice(write_len)).expect("write failed");
-                do_sync(&file, args.sync_data);
+                do_sync(&file, args.sync_mode);
                 let primary_lat = t0.elapsed().as_micros() as u64;
 
                 let replica_lat = replica_handle.await.expect("replica task panicked");
@@ -75,7 +75,7 @@ pub async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
             } else {
                 let t0 = Instant::now();
                 file.write_all(abuf.as_slice(write_len)).expect("write failed");
-                do_sync(&file, args.sync_data);
+                do_sync(&file, args.sync_mode);
                 let lat = t0.elapsed();
                 if seq >= args.warmup as u64 {
                     latencies_us.push(lat.as_micros() as u64);
@@ -88,7 +88,7 @@ pub async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
             if let Some(ref replica_arc) = replica_file {
                 let replica_arc = replica_arc.clone();
                 let record_copy = record_buf[..write_len].to_vec();
-                let sync_data = args.sync_data;
+                let sync_mode = args.sync_mode;
 
                 let t0 = Instant::now();
 
@@ -97,12 +97,12 @@ pub async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
                     let t_replica = Instant::now();
                     let mut rfile = replica_arc.lock().unwrap();
                     rfile.write_all(&record_copy).expect("replica write failed");
-                    do_sync(&rfile, sync_data);
+                    do_sync(&rfile, sync_mode);
                     t_replica.elapsed().as_micros() as u64
                 });
 
                 file.write_all(&record_buf[..write_len]).expect("write failed");
-                do_sync(&file, args.sync_data);
+                do_sync(&file, args.sync_mode);
                 let primary_lat = t0.elapsed().as_micros() as u64;
 
                 let replica_lat = replica_handle.await.expect("replica task panicked");
@@ -117,7 +117,7 @@ pub async fn writer_task_std(args: &Args, task_id: usize) -> TaskResult {
             } else {
                 let t0 = Instant::now();
                 file.write_all(&record_buf[..write_len]).expect("write failed");
-                do_sync(&file, args.sync_data);
+                do_sync(&file, args.sync_mode);
                 let lat = t0.elapsed();
                 if seq >= args.warmup as u64 {
                     latencies_us.push(lat.as_micros() as u64);

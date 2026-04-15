@@ -26,16 +26,19 @@ cargo build --release
 
 ```bash
 # Basic NFS benchmark: 8 concurrent writers, O_DIRECT, fdatasync
-./target/release/wal-bench --dir /mnt/nfs/wal-test -c 8 -m channel --direct --sync-data
+./target/release/wal-bench --dir /mnt/nfs/wal-test -c 8 -m channel --direct --sync-mode fdatasync
+
+# O_DSYNC (FUA) -- bypass block-layer flush serialization on NVMe
+./target/release/wal-bench --dir /tmp/wal-test -c 4 -m std --direct --sync-mode dsync
 
 # Pure kernel threads, pinned to cores 4-5
-./target/release/wal-bench --dir /tmp/wal-test -c 2 -m thread --io-cores 4,5 --direct --sync-data
+./target/release/wal-bench --dir /tmp/wal-test -c 2 -m thread --io-cores 4,5 --direct --sync-mode fdatasync
 
 # COW dual-write to two directories
-./target/release/wal-bench --dir /mnt/nfs-west/wal -c 4 -m channel --replica-dir /mnt/nfs-east/wal --direct --sync-data
+./target/release/wal-bench --dir /mnt/nfs-west/wal -c 4 -m channel --replica-dir /mnt/nfs-east/wal --direct --sync-mode fdatasync
 
 # With sync tracing for latency analysis
-./target/release/wal-bench --dir /tmp/wal-test -c 2 -m thread --direct --sync-data --trace-sync
+./target/release/wal-bench --dir /tmp/wal-test -c 2 -m thread --direct --sync-mode fdatasync --trace-sync
 ```
 
 ## I/O Modes
@@ -56,7 +59,7 @@ cargo build --release
 | `-n`, `--writes-per-task` | 1000 | Total writes per task |
 | `-m`, `--io-mode` | std | I/O mode: std, tokio, channel, thread |
 | `--direct` | false | Open files with O_DIRECT |
-| `--sync-data` | false | Use fdatasync instead of fsync |
+| `--sync-mode` | fsync | Sync mode: `fsync`, `fdatasync`, `dsync` (O_DSYNC/FUA), `none` |
 | `--min-record-size` | 64 | Minimum WAL record size (bytes) |
 | `--max-record-size` | 8192 | Maximum WAL record size (bytes) |
 | `--warmup` | 0 | Warmup writes per task (excluded from stats) |
