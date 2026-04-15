@@ -67,7 +67,7 @@ p50 at c=1 is higher (~1,716 μs vs 852 μs)
 - [linux/block/blk-flush.c](https://github.com/torvalds/linux/blob/master/block/blk-flush.c) -- flush state machine serialization
 - [Kernel docs: writeback cache control](https://docs.kernel.org/block/writeback_cache_control.html) -- REQ_PREFLUSH vs REQ_FUA
 
-## PostgreSQL WAL Implementation Approach ()
+## PostgreSQL WAL Implementation Approach ([972c14f](https://github.com/postgres/postgres/tree/972c14fb9134fdfd76ea6ebcf98a55a945bbc988))
 
 [5 sync methods:](https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/backend/access/transam/xlog.c#L178)
 * fsync
