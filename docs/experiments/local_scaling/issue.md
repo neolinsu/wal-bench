@@ -86,6 +86,7 @@ p50 at c=1 is higher (~1,716 μs vs 852 μs)
 >
 > If a volatile write cache is enabled (refer to section 5.2.26.1.4), then the Flush command shall commit data and metadata associated with the specified namespace(s) to non-volatile storage media.
 
+This indicates the SSD controller should serialize the `FLUSH` operations, even the ops are in different `Queue`.  
 ## References
 
 - [linux/block/blk-flush.c](https://github.com/torvalds/linux/blob/master/block/blk-flush.c) -- flush state machine serialization
