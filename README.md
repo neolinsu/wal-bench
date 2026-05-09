@@ -65,15 +65,26 @@ cargo build --release
 | `--warmup` | 0 | Warmup writes per task (excluded from stats) |
 | `--worker-cores` | all | Pin tokio worker threads (e.g. `0-3`) |
 | `--io-cores` | none | Pin I/O threads for channel/thread modes (e.g. `4-7`) |
+| `--max-blocking-threads` | 512 | Max blocking threads for tokio runtime (used by `tokio` mode's `spawn_blocking` pool) |
 | `--replica-dir` | none | Enable COW dual-write to a second directory |
-| `--trace-sync` | false | Write per-fdatasync timestamps to `sync-trace.tsv` |
-| `--stagger-us` | 0 | Stagger task starts by N*task_id microseconds |
+| `--trace-sync` | false | Write per-fdatasync timestamps to `<dir>/sync-trace.tsv` (channel/thread modes only) |
+| `--stagger-us` | 0 | Stagger task starts by N*task_id microseconds (channel/thread modes only; ignored by std/tokio) |
 | `--spread-dirs` | false | Place each task's file in its own subdirectory |
 | `--cleanup` | false | Remove WAL files after benchmark |
 
 ## Output
 
-Reports wall time, throughput (MB/s), IOPS, and fsync latency percentiles (p50/p90/p99/p99.9), plus per-task breakdown. With `--replica-dir`, latencies are reported separately for combined, primary, and replica.
+Reports wall time, total writes, total data, throughput (MB/s), IOPS, and fsync latency stats (min, p50/p90/p99/p99.9, max) plus a per-task breakdown table. With `--replica-dir`, latencies are reported separately for combined, primary, and replica. With `--trace-sync`, per-sync start/end timestamps are written to `<dir>/sync-trace.tsv` with columns `task / source / start_ns / end_ns` (`source` is `primary` or `replica`).
+
+## Kernel-side tracing
+
+`scripts/trace_write_syscall.sh` captures the kernel call graph inside `ksys_write()` while wal-bench runs at varying concurrency levels, using ftrace's `function_graph` tracer. Useful for finding which kernel path dominates fdatasync tail latency. Requires root.
+
+```bash
+sudo ./scripts/trace_write_syscall.sh --max-conc 4 --writes 500
+```
+
+Per-run raw traces and slow-function summaries land in `./trace-out/`. See the script header for all options (record size, sync mode, ftrace thresholds, core pinning base).
 
 ## License
 
